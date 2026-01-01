@@ -1,4 +1,4 @@
-# main.py (完整版)
+# main.py (修正版)
 
 import json
 import asyncio
@@ -10,7 +10,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.provider import ProviderRequest, LLMResponse
-# 新增/确保以下引用存在
+# 确保以下引用存在
 import astrbot.api.message_components as Comp
 from astrbot.api.message_components import BaseMessageComponent
 
@@ -23,14 +23,10 @@ class HapeMemoryPlugin(Star):
         super().__init__(context)
         self.config = config
         
-        # 使用 StarTools 获取规范的数据存储目录
         data_dir = StarTools.get_data_dir("hapemxg_memory")
         db.set_path(str(data_dir / "memory_data.json"))
         
-        # 配置参数读取
-        # 历史窗口大小：传递给 LLM 的上下文长度
         self.HISTORY_WINDOW_SIZE = self.config.get("history_window_size", 30)
-        # 更新频率：每多少条消息触发一次更新
         self.UPDATE_INTERVAL = self.config.get("update_interval", 10)
         
         self.clean_patterns = self.config.get("clean_patterns", [])
@@ -53,30 +49,33 @@ class HapeMemoryPlugin(Star):
         cleaned = text
         for pattern in self.clean_patterns:
             try:
+                # 使用 re.escape 来处理特殊字符，但这会破坏用户的本意，因此注释掉
+                # 更建议用户编写正确的正则表达式，例如用 \[ 和 \] 替代 [ 和 ]
                 cleaned = re.sub(pattern, "", cleaned)
             except re.error as e:
                 logger.error(f"[Memory] Invalid regex pattern '{pattern}': {e}")
         return cleaned.strip()
 
     def _message_chain_to_text(self, chain: List[BaseMessageComponent]) -> str:
-        """将消息链转换为字符串，用占位符代表图片、At等非文本内容。"""
-        text_parts = []
+        """[修正] 将消息链稳健地转换为字符串，用占位符代表图片、At等非文本内容。"""
         if not chain:
             return ""
-            
+
+        text_parts = []
         for component in chain:
             if isinstance(component, Comp.Plain):
-                text_parts.append(component.text.strip())
+                if component.text and component.text.strip():
+                    text_parts.append(component.text.strip())
             elif isinstance(component, Comp.Image):
                 text_parts.append("[用户发送了一张图片]")
             elif isinstance(component, Comp.At):
-                # 将 At 对象转换为更易读的文本
                 text_parts.append(f"[@{getattr(component, 'qq', '未知用户')}]")
         
-        full_text = " ".join(filter(None, text_parts)).strip()
-        # 复用已有的清理逻辑
+        # --- 核心修改在这里 ---
+        # 使用列表推导式替换 filter() 来避免命名冲突
+        full_text = " ".join([part for part in text_parts if part]).strip()
+        
         return self._clean_text(full_text)
-
 
     @filter.command_group("memory")
     def memory_group(self):
@@ -130,7 +129,6 @@ class HapeMemoryPlugin(Star):
             
         yield event.plain_result(f"正在尝试根据最近的对话更新 {target_msg} 的记忆...")
         
-        # 强制更新后重置计数器
         db.reset_counter(db_key)
         asyncio.create_task(self._update_memory_task(db_key, buffer_copy))
 
@@ -167,7 +165,6 @@ class HapeMemoryPlugin(Star):
         if not buffer_copy:
             return json.dumps({"success": False, "message": "最近没有新的对话记录，无法提取记忆。"}, ensure_ascii=False)
             
-        # 工具触发更新也重置计数器
         db.reset_counter(db_key)
         asyncio.create_task(self._update_memory_task(db_key, buffer_copy, reason=reason))
         
@@ -205,58 +202,54 @@ class HapeMemoryPlugin(Star):
         
         if self.config.get("debug_memory"):
             log_message = (
-                f"[Memory Debug] Current impression for user '{db_key}':\n"
-                f"------------------ USER MEMORY START ------------------\n"
-                f"{mem_text if mem_text.strip() else 'No memory found for this user.'}\n"
-                f"------------------- USER MEMORY END -------------------"
+                f"[Memory Debug] 用户 '{db_key}' 的当前印象:\n"
+                f"------------------ 用户记忆 开始 ------------------\n"
+                f"{mem_text if mem_text.strip() else '未找到该用户的记忆信息。'}\n"
+                f"------------------- 用户记忆 结束 -------------------"
+
             )
             logger.info(log_message)
 
-        # 2. 记录用户消息 (使用新函数处理图片和@等)
+        # 2. 记录用户消息 (使用修正后的函数)
         processed_message = self._message_chain_to_text(event.message_obj.message)
         
         if processed_message:
             user_msg = f"[USER]: {processed_message}"
             async with self.lock:
-                # 存入缓冲区，保持滑动窗口大小
                 db.add_to_buffer(db_key, user_msg, max_len=self.HISTORY_WINDOW_SIZE)
-                # 增加更新计数器
                 db.increment_counter(db_key)
 
     @filter.on_llm_response()
     async def collect_history_and_update(self, event: AstrMessageEvent, resp: LLMResponse):
         """响应后：记录AI消息 + 增加计数 + 检查是否触发更新"""
         db_key = self._get_db_key(event)
-        if not db_key or not resp or not resp.completion_text:
+        if not db_key or not resp:
             return
 
-        # 1. 记录 AI 消息
-        clean_resp = self._clean_text(resp.completion_text)
+        # [修正] 即使 completion_text 为空也要处理，因为AI可能通过工具等方式响应
+        # 但我们只记录文本部分，所以依然依赖 completion_text
+        ai_response_text = resp.completion_text if resp.completion_text else ""
+        clean_resp = self._clean_text(ai_response_text)
+
+        # 只有当清理后仍有文本内容时才记录，避免空消息
         if clean_resp:
             ai_msg = f"[ASSISTANT]: {clean_resp}"
             async with self.lock:
-                # 存入缓冲区，保持滑动窗口大小
                 db.add_to_buffer(db_key, ai_msg, max_len=self.HISTORY_WINDOW_SIZE)
-                # 增加更新计数器
                 db.increment_counter(db_key)
                 
-                # 获取当前计数和数据
                 current_counter = db.get_counter(db_key)
                 buffer_copy = list(db.get_buffer(db_key))
 
-            # 2. 检查计数器是否达到更新频率
             if current_counter >= self.UPDATE_INTERVAL:
                 if self.config.get("debug_memory"):
                     logger.info(f"Triggering memory update for {db_key}, counter: {current_counter}/{self.UPDATE_INTERVAL}")
                 
-                # 重置计数器
                 db.reset_counter(db_key)
-                
-                # 异步启动更新任务
                 asyncio.create_task(self._update_memory_task(db_key, buffer_copy))
 
     def _extract_json(self, text: str):
-        match = re.search(r"\{[\s\S]*\}", text) # 更鲁棒的JSON提取
+        match = re.search(r"\{[\s\S]*\}", text)
         if match:
             return match.group(0)
         return text
@@ -269,11 +262,7 @@ class HapeMemoryPlugin(Star):
         prompt = f"""请将以下关于用户的记忆片段进行“高保真压缩”。\n要求：\n1. 极度精简，保留最核心的事实、时间点和关键数据。\n2. 去除修饰词、废话和重复信息。\n3. 必须使用中文。\n4. 最终长度严格控制在 150 字以内。\n5. 直接输出结果，不要包含任何解释。\n\n需要压缩的内容：\n{text}"""
 
         try:
-            response = await provider.text_chat(
-                prompt=prompt,
-                session_id=None,
-                contexts=[],
-            )
+            response = await provider.text_chat(prompt=prompt, session_id=None, contexts=[])
             if response and response.completion_text:
                 compressed = response.completion_text.strip()
                 logger.info(f"[Memory] Compression successful: {len(text)} -> {len(compressed)}")
@@ -290,7 +279,7 @@ class HapeMemoryPlugin(Star):
             
             reason_prompt = ""
             if reason:
-                reason_prompt = f"\n\n【系统提示】本次更新由对话模型主动请求，并附带了以下注记：\n\"{reason}\"\n请自行判断将该信息归类到哪个字段其中之一最为合适"
+                reason_prompt = f"\n\n【系统提示】本次更新由对话模型主动请求，并附带了以下注记：\n\"{reason}\"\n请自行判断将该信息归类到哪个字段其中之一最为合适\n"
 
             prompt = f"""你是一个专业的记忆归档员。你的任务是根据聊天记录更新用户的档案。\n**重要前提**：生成的这份档案将直接提供给【AI助手自己】（也就是未来的你）阅读，以便你更好地服务用户。\n\n当前关于该用户的记忆：\n{old_memory.to_text() if old_memory.to_text() else "尚无先前记忆。"}\n\n{reason_prompt}\n最近的聊天记录：\n{history_text}\n\n任务指令：\n结合【当前记忆】、【最近聊天记录】以及可能存在的【注记】，更新该用户的画像。\n1. **视角转换**：在描述用户与AI的互动、态度或共同经历时，**必须使用第二人称“你”来指代AI助手**。\n   - 错误示例：“用户不喜欢AI助手开玩笑。”\n   - 正确示例：“用户不喜欢**你**开玩笑。”\n   - 正确示例：“用户曾和**你**一起讨论过哲学问题。”\n2. **准确性**：保留旧记忆中仍然准确的信息，用新信息补充或修正。\n3. **精简**：如果某个字段没有新信息且旧记忆中不存在，返回 null。不要编造。\n4. **语言**：所有内容必须使用中文。\n\n你必须以严格的 JSON 格式输出结果，JSON 结构如下：\n{{\n    "disposition": "性格特征/人物画像",\n    "interests": "兴趣和爱好",\n    "doings": "他们目前正在做的事情",\n    "works": "职业或工作",\n    "wishes": "目标或心愿",\n    "worries": "烦恼或担忧",\n    "skills": "技能或专长",\n    "attitudes_to_model": "用户对【你】的态度 (请用'你'指代AI，例如：'觉得你很幽默')",\n    "experiences_with_model": "用户与【你】的共同经历 (请用'你'指代AI，例如：'曾向你请教知识')",\n    "extra_info": "任何其他能帮助【你】了解该用户的重要信息"\n}}\n\n仅输出 JSON 字符串，不要包含 Markdown 代码块（如 ```json ... ```）。"""
 
@@ -298,20 +287,12 @@ class HapeMemoryPlugin(Star):
                 logger.info(f"[Memory Debug] Update Request for {db_key}:\n{prompt}")
 
             provider_id = self.config.get("summary_provider_id", "")
-            provider = None
-            if provider_id:
-                provider = self.context.get_provider_by_id(provider_id)
-            if not provider:
-                provider = self.context.get_using_provider()
+            provider = self.context.get_provider_by_id(provider_id) if provider_id else self.context.get_using_provider()
             if not provider:
                 logger.warn("No LLM provider available for memory update.")
                 return
 
-            response = await provider.text_chat(
-                prompt=prompt,
-                session_id=None,
-                contexts=[],
-            )
+            response = await provider.text_chat(prompt=prompt, session_id=None, contexts=[])
             
             raw_result = response.completion_text
             if not raw_result:
@@ -328,7 +309,6 @@ class HapeMemoryPlugin(Star):
                 
                 new_memory = mem_result.get_updated_memory(old_memory)
                 
-                # 压缩逻辑
                 fields_to_check = ["experiences_with_you", "extra_info", "doings", "wishes"]
                 for field in fields_to_check:
                     val = getattr(new_memory, field)
