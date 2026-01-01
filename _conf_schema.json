@@ -1,0 +1,38 @@
+{
+    "history_window_size": {
+        "type": "int",
+        "description": "记忆上下文窗口大小 (传递给记忆LLM的对话历史长度，建议 20-50)",
+        "default": 30
+    },
+    "update_interval": {
+        "type": "int",
+        "description": "记忆更新频率 (每新增多少条消息触发一次记忆更新，建议 5-10)",
+        "default": 10
+    },
+    "summary_provider_id": {
+        "type": "string",
+        "description": "用于总结记忆的特定 LLM 服务提供商 ID (为空则使用当前全局默认的提供商)",
+        "default": ""
+    },
+    "memory_scope": {
+        "type": "bool",
+        "description": "是否开启会话隔离 (开启则按群组隔离记忆，关闭则全局共享)",
+        "default": false
+    },
+    "debug_memory": {
+        "type": "bool",
+        "description": "是否打印详细的记忆更新日志",
+        "default": false
+    },
+    "clean_patterns": {
+        "type": "list",
+        "description": "需要从记忆记录中清除的正则表达式列表 (例如屏蔽好感度标记)",
+        "items": {
+            "type": "string"
+        },
+        "default": [
+            "[好感度.*?]",
+            "【.*?】"
+        ]
+    }
+}
