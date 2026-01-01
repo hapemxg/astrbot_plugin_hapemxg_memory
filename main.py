@@ -35,12 +35,16 @@ class HapeMemoryPlugin(Star):
     def _get_db_key(self, event: AstrMessageEvent) -> str:
         return self._resolve_db_key(event, None)
 
+    # main.py (修正后的代码)
     def _resolve_db_key(self, event: AstrMessageEvent, target_user_id: Optional[str]) -> str:
         final_user_id = target_user_id if target_user_id else event.get_sender_id()
         if self.config.get("memory_scope", False):
-            group_id = getattr(event, "group_id", None)
+            # 从 event.message_obj 中获取 group_id
+            group_id = event.message_obj.group_id
+            # 如果 group_id 存在 (不是空字符串), 则说明是群聊
             if group_id:
                 return f"{group_id}_{final_user_id}"
+        # 如果关闭了会话隔离, 或者是私聊 (group_id为空), 则直接返回用户ID
         return final_user_id
 
     def _clean_text(self, text: str) -> str:
