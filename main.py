@@ -1,3 +1,5 @@
+# main.py (完整版)
+
 import json
 import asyncio
 import re
@@ -8,6 +10,9 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.provider import ProviderRequest, LLMResponse
+# 新增/确保以下引用存在
+import astrbot.api.message_components as Comp
+from astrbot.api.message_components import BaseMessageComponent
 
 from .db import db
 from .models import MemoryAboutUser, MemoryResult
@@ -52,6 +57,26 @@ class HapeMemoryPlugin(Star):
             except re.error as e:
                 logger.error(f"[Memory] Invalid regex pattern '{pattern}': {e}")
         return cleaned.strip()
+
+    def _message_chain_to_text(self, chain: List[BaseMessageComponent]) -> str:
+        """将消息链转换为字符串，用占位符代表图片、At等非文本内容。"""
+        text_parts = []
+        if not chain:
+            return ""
+            
+        for component in chain:
+            if isinstance(component, Comp.Plain):
+                text_parts.append(component.text.strip())
+            elif isinstance(component, Comp.Image):
+                text_parts.append("[用户发送了一张图片]")
+            elif isinstance(component, Comp.At):
+                # 将 At 对象转换为更易读的文本
+                text_parts.append(f"[@{getattr(component, 'qq', '未知用户')}]")
+        
+        full_text = " ".join(filter(None, text_parts)).strip()
+        # 复用已有的清理逻辑
+        return self._clean_text(full_text)
+
 
     @filter.command_group("memory")
     def memory_group(self):
@@ -162,33 +187,36 @@ class HapeMemoryPlugin(Star):
         memory = db.get_memory(db_key)
         mem_text = memory.to_text()
         
-        # 从 event 对象中获取群组ID和发送者ID
         group_id = getattr(event, "group_id", "私聊")
         sender_id = event.get_sender_id()
 
-        # 按照你指定的格式，构建新的包含会话信息的记忆提示词
-        # 无论是否存在记忆，都会注入这个包含当前会话信息的模板
         memory_prompt = (
             f"\n\n--- [用户记忆系统] ---\n"
             f"当前群号: {group_id}\n"
             f"当前用户QQ号: {sender_id}\n"
             f"你有一些关于该用户的记忆：\n{mem_text if mem_text else '尚无记忆。'}\n\n"
-            f"[提示] 如果你发现了关于用户的新的重要信息，或者你觉得记忆和现实有严重的偏差，你可以使用 'update_user_memory' 工具主动更新用户画像。\n"
-            f"--- [用户记忆结束] ---\n"
+            f"[提示] 如果你发现了关于用户的新的重要信息，你可以使用 'update_user_memory' 工具主动更新用户画像。\n"
+            f"--- [用户记忆结束] ---"
         )
 
-        # 将构建好的提示词注入到 system_prompt
         if req.system_prompt is None:
             req.system_prompt = ""
         req.system_prompt += memory_prompt
         
         if self.config.get("debug_memory"):
-            logger.info(f"[Memory Debug] Injected memory and session info for {db_key}")
+            log_message = (
+                f"[Memory Debug] Current impression for user '{db_key}':\n"
+                f"------------------ USER MEMORY START ------------------\n"
+                f"{mem_text if mem_text.strip() else 'No memory found for this user.'}\n"
+                f"------------------- USER MEMORY END -------------------"
+            )
+            logger.info(log_message)
 
-        # 2. 记录用户消息 (原逻辑不变)
-        clean_msg = self._clean_text(event.message_str)
-        if clean_msg:
-            user_msg = f"[USER]: {clean_msg}"
+        # 2. 记录用户消息 (使用新函数处理图片和@等)
+        processed_message = self._message_chain_to_text(event.message_obj.message)
+        
+        if processed_message:
+            user_msg = f"[USER]: {processed_message}"
             async with self.lock:
                 # 存入缓冲区，保持滑动窗口大小
                 db.add_to_buffer(db_key, user_msg, max_len=self.HISTORY_WINDOW_SIZE)
@@ -228,7 +256,7 @@ class HapeMemoryPlugin(Star):
                 asyncio.create_task(self._update_memory_task(db_key, buffer_copy))
 
     def _extract_json(self, text: str):
-        match = re.search(r"{{.*}}", text, re.DOTALL)
+        match = re.search(r"\{[\s\S]*\}", text) # 更鲁棒的JSON提取
         if match:
             return match.group(0)
         return text
@@ -262,7 +290,7 @@ class HapeMemoryPlugin(Star):
             
             reason_prompt = ""
             if reason:
-                reason_prompt = f"\n\n【系统提示】本次更新由对话模型主动请求，并附带了以下注记：\n\"{reason}\"\n请自行判断将该信息归类到哪个字段其中之一最为合适\n"
+                reason_prompt = f"\n\n【系统提示】本次更新由对话模型主动请求，并附带了以下注记：\n\"{reason}\"\n请自行判断将该信息归类到哪个字段其中之一最为合适"
 
             prompt = f"""你是一个专业的记忆归档员。你的任务是根据聊天记录更新用户的档案。\n**重要前提**：生成的这份档案将直接提供给【AI助手自己】（也就是未来的你）阅读，以便你更好地服务用户。\n\n当前关于该用户的记忆：\n{old_memory.to_text() if old_memory.to_text() else "尚无先前记忆。"}\n\n{reason_prompt}\n最近的聊天记录：\n{history_text}\n\n任务指令：\n结合【当前记忆】、【最近聊天记录】以及可能存在的【注记】，更新该用户的画像。\n1. **视角转换**：在描述用户与AI的互动、态度或共同经历时，**必须使用第二人称“你”来指代AI助手**。\n   - 错误示例：“用户不喜欢AI助手开玩笑。”\n   - 正确示例：“用户不喜欢**你**开玩笑。”\n   - 正确示例：“用户曾和**你**一起讨论过哲学问题。”\n2. **准确性**：保留旧记忆中仍然准确的信息，用新信息补充或修正。\n3. **精简**：如果某个字段没有新信息且旧记忆中不存在，返回 null。不要编造。\n4. **语言**：所有内容必须使用中文。\n\n你必须以严格的 JSON 格式输出结果，JSON 结构如下：\n{{\n    "disposition": "性格特征/人物画像",\n    "interests": "兴趣和爱好",\n    "doings": "他们目前正在做的事情",\n    "works": "职业或工作",\n    "wishes": "目标或心愿",\n    "worries": "烦恼或担忧",\n    "skills": "技能或专长",\n    "attitudes_to_model": "用户对【你】的态度 (请用'你'指代AI，例如：'觉得你很幽默')",\n    "experiences_with_model": "用户与【你】的共同经历 (请用'你'指代AI，例如：'曾向你请教知识')",\n    "extra_info": "任何其他能帮助【你】了解该用户的重要信息"\n}}\n\n仅输出 JSON 字符串，不要包含 Markdown 代码块（如 ```json ... ```）。"""
 
