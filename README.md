@@ -1,6 +1,8 @@
 # helloworld
 
-这是hapemxg的记忆插件 参考了隔壁tg上的kmua-bot-2的设计
+AstrBot 插件模板
+
+A template plugin for AstrBot plugin feature
 
 # 支持
 

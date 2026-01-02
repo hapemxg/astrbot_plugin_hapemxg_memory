@@ -3,4 +3,4 @@ display_name: hapemxg_memory
 desc: 给AstrBot添加长久记忆功能，模仿kmua的记忆机制。
 version: 0.1.0
 author: "hapemxg"
-repo: https://github.com/AstrBotDevs/AstrBot
+repo: https://github.com/hapemxg/astrbot_plugin_hapemxg_memory
