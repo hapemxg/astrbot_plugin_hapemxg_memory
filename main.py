@@ -1,3 +1,5 @@
+# main.py (修正版)
+
 import json
 import asyncio
 import re
@@ -84,9 +86,34 @@ class HapeMemoryPlugin(Star):
         pass
 
     @memory_group.command("status")
-    async def memory_status(self, event: AstrMessageEvent):
-        """查看当前记忆和更新进度"""
-        db_key = self._get_db_key(event)
+    async def memory_status(self, event: AstrMessageEvent, user_id: str = None):
+        """查看当前记忆和更新进度
+        
+        参数:
+            user_id (可选): 指定查询的用户ID。如果不填则查询自己。查询他人需要管理员权限。
+        """
+        sender_id = event.get_sender_id()
+        
+        # --- 新增逻辑: 权限检查 (修复版) ---
+        if user_id and user_id != sender_id:
+            # [修复] 尝试从 Context 的内部属性 _config 中获取全局管理员列表
+            # 这里的 getattr 是为了兼容性，优先尝试 _config
+            global_config = getattr(self.context, "_config", {})
+            if not global_config:
+                 # 再次尝试 config (防止未来版本改回)
+                 global_config = getattr(self.context, "config", {})
+            
+            # 获取 admins_id，默认为空列表
+            admins = global_config.get("admins_id", [])
+            
+            if sender_id not in admins:
+                yield event.plain_result("只有管理员可以查看其他用户的记忆状态。")
+                return
+
+        # --- 键值解析 ---
+        db_key = self._resolve_db_key(event, user_id)
+        
+        # --- 原有逻辑 ---
         memory = db.get_memory(db_key)
         counter = db.get_counter(db_key)
         buffer_len = len(db.get_buffer(db_key))
@@ -95,10 +122,12 @@ class HapeMemoryPlugin(Star):
         
         info = f"【当前状态】\n缓冲队列: {buffer_len}/{self.HISTORY_WINDOW_SIZE} 条\n更新进度: {counter}/{self.UPDATE_INTERVAL} (再过 {max(0, self.UPDATE_INTERVAL - counter)} 条消息触发更新)\n\n"
         
+        target_name = f"用户 {user_id}" if user_id and user_id != sender_id else "你"
+        
         if not mem_text.strip():
-             yield event.plain_result(info + "我对你还没有什么印象呢~ 多聊聊吧！")
+             yield event.plain_result(info + f"我对{target_name}还没有什么印象呢~ 多聊聊吧！")
         else:
-            yield event.plain_result(info + f"我对你的印象：\n{mem_text}")
+            yield event.plain_result(info + f"我对{target_name}的印象：\n{mem_text}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @memory_group.command("forget")
