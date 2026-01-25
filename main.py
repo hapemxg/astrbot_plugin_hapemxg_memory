@@ -1,4 +1,4 @@
-# main.py (修正版)
+# main.py (完整修改版)
 
 import json
 import asyncio
@@ -35,16 +35,12 @@ class HapeMemoryPlugin(Star):
     def _get_db_key(self, event: AstrMessageEvent) -> str:
         return self._resolve_db_key(event, None)
 
-    # main.py (修正后的代码)
     def _resolve_db_key(self, event: AstrMessageEvent, target_user_id: Optional[str]) -> str:
         final_user_id = target_user_id if target_user_id else event.get_sender_id()
         if self.config.get("memory_scope", False):
-            # 从 event.message_obj 中获取 group_id
             group_id = event.message_obj.group_id
-            # 如果 group_id 存在 (不是空字符串), 则说明是群聊
             if group_id:
                 return f"{group_id}_{final_user_id}"
-        # 如果关闭了会话隔离, 或者是私聊 (group_id为空), 则直接返回用户ID
         return final_user_id
 
     def _clean_text(self, text: str) -> str:
@@ -53,8 +49,6 @@ class HapeMemoryPlugin(Star):
         cleaned = text
         for pattern in self.clean_patterns:
             try:
-                # 使用 re.escape 来处理特殊字符，但这会破坏用户的本意，因此注释掉
-                # 更建议用户编写正确的正则表达式，例如用 \[ 和 \] 替代 [ 和 ]
                 cleaned = re.sub(pattern, "", cleaned)
             except re.error as e:
                 logger.error(f"[Memory] Invalid regex pattern '{pattern}': {e}")
@@ -75,8 +69,6 @@ class HapeMemoryPlugin(Star):
             elif isinstance(component, Comp.At):
                 text_parts.append(f"[@{getattr(component, 'qq', '未知用户')}]")
         
-        # --- 核心修改在这里 ---
-        # 使用列表推导式替换 filter() 来避免命名冲突
         full_text = " ".join([part for part in text_parts if part]).strip()
         
         return self._clean_text(full_text)
@@ -94,26 +86,19 @@ class HapeMemoryPlugin(Star):
         """
         sender_id = event.get_sender_id()
         
-        # --- 新增逻辑: 权限检查 (修复版) ---
         if user_id and user_id != sender_id:
-            # [修复] 尝试从 Context 的内部属性 _config 中获取全局管理员列表
-            # 这里的 getattr 是为了兼容性，优先尝试 _config
             global_config = getattr(self.context, "_config", {})
             if not global_config:
-                 # 再次尝试 config (防止未来版本改回)
                  global_config = getattr(self.context, "config", {})
             
-            # 获取 admins_id，默认为空列表
             admins = global_config.get("admins_id", [])
             
             if sender_id not in admins:
                 yield event.plain_result("只有管理员可以查看其他用户的记忆状态。")
                 return
 
-        # --- 键值解析 ---
         db_key = self._resolve_db_key(event, user_id)
         
-        # --- 原有逻辑 ---
         memory = db.get_memory(db_key)
         counter = db.get_counter(db_key)
         buffer_len = len(db.get_buffer(db_key))
@@ -164,6 +149,29 @@ class HapeMemoryPlugin(Star):
         asyncio.create_task(self._update_memory_task(db_key, buffer_copy))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @memory_group.command("compress")
+    async def memory_compress_cmd(self, event: AstrMessageEvent, user_id: str = None):
+        """[管理员] 手动压缩指定用户的记忆，去除冗余"""
+        db_key = self._resolve_db_key(event, user_id)
+        memory = db.get_memory(db_key)
+        
+        provider_id = self.config.get("summary_provider_id", "")
+        provider = self.context.get_provider_by_id(provider_id) if provider_id else self.context.get_using_provider()
+        
+        if not provider:
+            yield event.plain_result("错误：未找到可用的 LLM Provider，无法执行压缩。")
+            return
+
+        yield event.plain_result(f"正在对 {user_id if user_id else '你'} 的记忆进行深度压缩整理，请稍候...")
+
+        new_memory, logs = await self._batch_compress_memory(memory, provider, force=True)
+        
+        db.update_memory(db_key, new_memory)
+        
+        log_str = "\n".join(logs)
+        yield event.plain_result(f"压缩完成！\n{log_str}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @memory_group.command("set")
     async def memory_set(self, event: AstrMessageEvent, key: str, value: str, user_id: str = None):
         """[管理员] 手动修改记忆"""
@@ -180,7 +188,13 @@ class HapeMemoryPlugin(Star):
 
     @filter.llm_tool(name="update_user_memory")
     async def update_user_memory(self, event: AstrMessageEvent, reason: str):
-        """主动触发记忆更新"""
+        """
+        当用户在对话中透露了重要的个人信息（如：姓名、年龄、喜好、厌恶、职业、人际关系、重要经历等）时，调用此工具以立即更新用户的长期记忆档案。
+        注意：请勿在普通闲聊或无关紧要的对话中滥用此工具。
+
+        Args:
+            reason (string): 简要描述需要被记忆的具体信息摘要。例如：“用户提到他养了一只叫Luna的猫”、“用户表示不喜欢吃香菜”。
+        """
         call_count = getattr(event, '_memory_tool_call_count', 0)
         call_count += 1
         setattr(event, '_memory_tool_call_count', call_count)
@@ -204,14 +218,13 @@ class HapeMemoryPlugin(Star):
             "message": "记忆更新任务已成功在后台启动。"
         }, ensure_ascii=False)
 
-    @filter.on_llm_request(priority=-1)
+    @filter.on_llm_request(priority=-2)
     async def inject_memory(self, event: AstrMessageEvent, req: ProviderRequest):
         """请求前：注入记忆 + 记录用户消息 + 增加计数"""
         db_key = self._get_db_key(event)
         if not db_key:
             return
 
-        # 1. 注入记忆和会话信息
         memory = db.get_memory(db_key)
         mem_text = memory.to_text()
         
@@ -237,11 +250,9 @@ class HapeMemoryPlugin(Star):
                 f"------------------ 用户记忆 开始 ------------------\n"
                 f"{mem_text if mem_text.strip() else '未找到该用户的记忆信息。'}\n"
                 f"------------------- 用户记忆 结束 -------------------"
-
             )
             logger.info(log_message)
 
-        # 2. 记录用户消息 (使用修正后的函数)
         processed_message = self._message_chain_to_text(event.message_obj.message)
         
         if processed_message:
@@ -257,12 +268,9 @@ class HapeMemoryPlugin(Star):
         if not db_key or not resp:
             return
 
-        # [修正] 即使 completion_text 为空也要处理，因为AI可能通过工具等方式响应
-        # 但我们只记录文本部分，所以依然依赖 completion_text
         ai_response_text = resp.completion_text if resp.completion_text else ""
         clean_resp = self._clean_text(ai_response_text)
 
-        # 只有当清理后仍有文本内容时才记录，避免空消息
         if clean_resp:
             ai_msg = f"[ASSISTANT]: {clean_resp}"
             async with self.lock:
@@ -285,22 +293,106 @@ class HapeMemoryPlugin(Star):
             return match.group(0)
         return text
 
-    async def _compress_text(self, text: str, provider) -> str:
-        if not text or len(text) <= 600:
+    async def _compress_text(self, text: str, provider, max_length: int = 50) -> str:
+        """
+        [底层原子方法] 只压缩传入的这一段文本，不涉及任何其他上下文。
+        """
+        if not text or len(text) < max_length * 0.8: 
             return text
 
-        logger.info(f"[Memory] Triggering compression for text (len: {len(text)})...")
-        prompt = f"""请将以下关于用户的记忆片段进行“高保真压缩”。\n要求：\n1. 极度精简，保留最核心的事实、时间点和关键数据。\n2. 去除修饰词、废话和重复信息。\n3. 必须使用中文。\n4. 最终长度严格控制在 150 字以内。\n5. 直接输出结果，不要包含任何解释。\n\n需要压缩的内容：\n{text}"""
+        prompt = f"""任务：文本压缩
+要求：
+1. 将下方【待压缩文本】的内容精简到 {max_length} 字以内。
+2. 只保留核心事实、关键时间点和重要名词。
+3. 去除无意义的修饰词、口语词和重复内容。
+4. 直接输出压缩后的结果，不要包含"好的"、"压缩结果："等废话。
+
+【待压缩文本】：
+{text}"""
 
         try:
             response = await provider.text_chat(prompt=prompt, session_id=None, contexts=[])
             if response and response.completion_text:
                 compressed = response.completion_text.strip()
-                logger.info(f"[Memory] Compression successful: {len(text)} -> {len(compressed)}")
+                compressed = compressed.strip('"').strip("'")
+                
+                if len(compressed) >= len(text) or not compressed:
+                    return text
+                    
+                logger.info(f"[Memory] Compressed: {len(text)} -> {len(compressed)} chars.")
                 return compressed
         except Exception as e:
-            logger.error(f"[Memory] Compression failed: {e}")
+            logger.error(f"[Memory] Compression API failed: {e}")
+        
         return text
+
+    async def _batch_compress_memory(self, memory: MemoryAboutUser, provider, force: bool = False) -> (MemoryAboutUser, List[str]):
+        """
+        [逻辑编排方法] 批量并发压缩内存对象中的字段
+        :param force: 是否强制压缩（手动模式下为 True，忽略长度阈值，只要超标就压）
+        :return: (更新后的内存对象, 变更日志列表)
+        """
+        rules = {
+            # --- 核心大段文本 ---
+            "experiences_with_you": {"trigger": 150, "target": 80}, # 共同经历：最容易变长，允许稍长
+            "extra_info":           {"trigger": 100, "target": 60}, # 补充信息：容易堆积杂项
+            
+            # --- 状态/描述类 ---
+            "attitudes_to_you":     {"trigger": 100,  "target": 60}, # 态度
+            "disposition":          {"trigger": 100,  "target": 60}, # 性格
+            
+            # --- 短语/列表类 (之前缺失的补回来了) ---
+            # 这里的阈值设置稍高，为了保护"列表"格式不被过度概括
+            "interests":            {"trigger": 160, "target": 90}, # 兴趣：防止写成小作文
+            "skills":               {"trigger": 160, "target": 90}, # 技能：同上
+            
+            # --- 短文本类 ---
+            "doings":               {"trigger": 60,  "target": 40}, # 正在做的事：时效性强，需精简
+            "wishes":               {"trigger": 60,  "target": 40}, # 愿望
+            "worries":              {"trigger": 60,  "target": 40}, # 烦恼
+            "works":                {"trigger": 60,  "target": 20}, # 工作：通常就是职业名，很短
+        }
+
+        tasks = []
+        logs = []
+
+        async def _task_wrapper(field, text, target):
+            new_text = await self._compress_text(text, provider, max_length=target)
+            if new_text != text:
+                return field, new_text
+            return None
+
+        for field, rule in rules.items():
+            val = getattr(memory, field)
+            if not val:
+                continue
+
+            threshold = 0 if force else rule["trigger"]
+            target_len = rule["target"]
+
+            if (force and len(val) > target_len) or (not force and len(val) > threshold):
+                logger.info(f"[Memory] Plan to compress '{field}': len {len(val)} -> target {target_len}")
+                tasks.append(_task_wrapper(field, val, target_len))
+
+        if not tasks:
+            return memory, ["没有字段需要压缩。"]
+
+        results = await asyncio.gather(*tasks)
+
+        changes_count = 0
+        for res in results:
+            if res:
+                field_name, new_val = res
+                old_len = len(getattr(memory, field_name))
+                new_len = len(new_val)
+                setattr(memory, field_name, new_val)
+                logs.append(f"[{field_name}] {old_len}字 -> {new_len}字")
+                changes_count += 1
+        
+        if changes_count == 0:
+            logs.append("虽然尝试了压缩，但LLM认为当前内容已是最简或压缩失败。")
+
+        return memory, logs
 
     async def _update_memory_task(self, db_key: str, messages: List[str], reason: str = None):
         """后台任务：调用 LLM 更新记忆"""
@@ -312,7 +404,7 @@ class HapeMemoryPlugin(Star):
             if reason:
                 reason_prompt = f"\n\n【系统提示】本次更新由对话模型主动请求，并附带了以下注记：\n\"{reason}\"\n请自行判断将该信息归类到哪个字段其中之一最为合适\n"
 
-            prompt = f"""你是一个专业的记忆归档员。你的任务是根据聊天记录更新用户的档案。\n**重要前提**：生成的这份档案将直接提供给【AI助手自己】（也就是未来的你）阅读，以便你更好地服务用户。\n\n当前关于该用户的记忆：\n{old_memory.to_text() if old_memory.to_text() else "尚无先前记忆。"}\n\n{reason_prompt}\n最近的聊天记录：\n{history_text}\n\n任务指令：\n结合【当前记忆】、【最近聊天记录】以及可能存在的【注记】，更新该用户的画像。\n1. **视角转换**：在描述用户与AI的互动、态度或共同经历时，**必须使用第二人称“你”来指代AI助手**。\n   - 错误示例：“用户不喜欢AI助手开玩笑。”\n   - 正确示例：“用户不喜欢**你**开玩笑。”\n   - 正确示例：“用户曾和**你**一起讨论过哲学问题。”\n2. **准确性**：保留旧记忆中仍然准确的信息，用新信息补充或修正。\n3. **精简**：如果某个字段没有新信息且旧记忆中不存在，返回 null。不要编造。\n4. **语言**：所有内容必须使用中文。\n\n你必须以严格的 JSON 格式输出结果，JSON 结构如下：\n{{\n    "disposition": "性格特征/人物画像",\n    "interests": "兴趣和爱好",\n    "doings": "ta目前正在做的事情",\n    "works": "职业或工作",\n    "wishes": "目标或心愿",\n    "worries": "烦恼或担忧",\n    "skills": "技能或专长",\n    "attitudes_to_model": "用户对【你】的态度 (请用'你'指代AI，例如：'觉得你很幽默')",\n    "experiences_with_model": "用户与【你】的共同经历 (请用'你'指代AI，例如：'曾向你请教知识')",\n    "extra_info": "任何其他能帮助【你】了解该用户的重要信息"\n}}\n\n仅输出 JSON 字符串，不要包含 Markdown 代码块（如 ```json ... ```）。"""
+            prompt = f"""你是一个专业的记忆归档员。你的任务是根据聊天记录更新这一名用户的档案。\n**重要前提**：生成的这份档案将直接提供给【AI助手自己】（也就是未来的你）阅读，以便你更好地服务用户。\n\n当前关于这名用户的记忆：\n{old_memory.to_text() if old_memory.to_text() else "尚无先前记忆。"}\n\n{reason_prompt}\n最近的聊天记录（请忽略掉和报错有关的内容）：\n{history_text}\n\n任务指令：\n结合【当前记忆】、【最近聊天记录】以及可能存在的【注记】，更新这名用户的画像。\n1. **视角转换**：在描述用户与AI的互动、态度或共同经历时，**必须使用第二人称“你”来指代AI助手**。\n   - 错误示例：“这个用户不喜欢AI助手开玩笑。”\n   - 正确示例：“这个用户不喜欢**你**开玩笑。”\n   - 正确示例：“这个用户曾和**你**一起讨论过哲学问题。”\n2. **准确性**：保留旧记忆中仍然准确的信息，用新信息补充或修正。\n3. **精简**：如果某个字段没有新信息且旧记忆中不存在，返回 null。不要编造。\n4. **语言**：所有内容必须使用中文。\n\n你必须以严格的 JSON 格式输出结果，JSON 结构如下：\n{{\n    "disposition": "性格特征/人物画像",\n    "interests": "兴趣和爱好",\n    "doings": "ta目前正在做的事情",\n    "works": "职业或工作",\n    "wishes": "目标或心愿",\n    "worries": "烦恼或担忧",\n    "skills": "技能或专长",\n    "attitudes_to_model": "这个用户对【你】的态度 (请用'你'指代AI，例如：'觉得你很幽默')",\n    "experiences_with_model": "这个用户与【你】的共同经历 (请用'你'指代AI，例如：'曾向你请教知识')",\n    "extra_info": "任何其他能帮助【你】了解这个用户的重要信息"\n}}\n\n仅输出 JSON 字符串，不要包含 Markdown 代码块（如 ```json ... ```）。"""
 
             if self.config.get("debug_memory"):
                 logger.info(f"[Memory Debug] Update Request for {db_key}:\n{prompt}")
@@ -338,16 +430,14 @@ class HapeMemoryPlugin(Star):
                 data = json.loads(cleaned_result)
                 mem_result = MemoryResult(**data)
                 
-                new_memory = mem_result.get_updated_memory(old_memory)
+                # 1. 先合并新旧记忆
+                intermediate_memory = mem_result.get_updated_memory(old_memory)
                 
-                fields_to_check = ["experiences_with_you", "extra_info", "doings", "wishes"]
-                for field in fields_to_check:
-                    val = getattr(new_memory, field)
-                    if val and len(val) > 600:
-                        new_val = await self._compress_text(val, provider)
-                        setattr(new_memory, field, new_val)
+                # 2. 调用新的批量压缩流程 (自动模式 force=False)
+                final_memory, _ = await self._batch_compress_memory(intermediate_memory, provider, force=False)
 
-                db.update_memory(db_key, new_memory)
+                # 3. 保存最终结果
+                db.update_memory(db_key, final_memory)
                 logger.info(f"Memory updated for {db_key} successfully.")
 
             except json.JSONDecodeError:
